@@ -1,4 +1,4 @@
-use crate::core::EventFailure::EventFailure;
+use crate::core::event_failure::EventFailure;
 
 /// Chain execution result
 #[derive(Debug)]

@@ -1,13 +1,38 @@
 use std::fmt;
 use crate::core::chain_result::{ChainResult, ChainStatus};
-use crate::core::EventContext::EventContext;
-use crate::core::EventFailure::EventFailure;
-use crate::core::EventResult::EventResult;
-use crate::core::FaultToleranceMode::FaultToleranceMode;
-use crate::events::ChainableEvent::ChainableEvent;
-use crate::events::EventMiddleware::EventMiddleware;
+use crate::core::event_context::EventContext;
+use crate::core::event_failure::EventFailure;
+use crate::core::event_result::EventResult;
+use crate::core::fault_tolerance_mode::FaultToleranceMode;
+use crate::events::chainable_event::ChainableEvent;
+use crate::events::event_middleware::EventMiddleware;
 
 /// Main EventChain orchestrator
+///
+/// Manages and executes a pipeline of events with optional middleware.
+///
+/// # Event Execution Order
+///
+/// * **Events**: Execute in FIFO order (first added → first executed)
+/// * **Middleware**: Execute in LIFO order (last added → first executed)
+///
+/// # Example
+///
+/// ```ignore
+/// use event_chains_project::core::EventChain::EventChain;
+/// use event_chains_project::core::EventContext::EventContext;
+/// use event_chains_project::core::FaultToleranceMode::FaultToleranceMode;
+///
+/// let chain = EventChain::new()
+///     .middleware(LoggingMiddleware)    // Outer layer
+///     .middleware(TimingMiddleware)     // Inner layer
+///     .event(ValidateEvent)             // Runs 1st
+///     .event(ProcessEvent)              // Runs 2nd
+///     .with_fault_tolerance(FaultToleranceMode::Lenient);
+///
+/// let mut context = EventContext::new();
+/// let result = chain.execute(&mut context);
+/// ```
 pub struct EventChain {
     events: Vec<Box<dyn ChainableEvent>>,
     middlewares: Vec<Box<dyn EventMiddleware>>,
@@ -15,6 +40,7 @@ pub struct EventChain {
 }
 
 impl EventChain {
+    /// Create a new empty event chain with strict fault tolerance
     pub fn new() -> Self {
         Self {
             events: Vec::new(),
@@ -23,35 +49,124 @@ impl EventChain {
         }
     }
 
+    /// Set the fault tolerance mode for this chain
+    ///
+    /// # Modes
+    ///
+    /// * [`FaultToleranceMode::Strict`] - Stop execution on first failure (default)
+    /// * [`FaultToleranceMode::Lenient`] - Continue execution, collect all failures
+    /// * [`FaultToleranceMode::BestEffort`] - Continue execution, collect all failures
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let chain = EventChain::new()
+    ///     .event(Event1)
+    ///     .event(Event2)
+    ///     .with_fault_tolerance(FaultToleranceMode::Lenient);
+    /// ```
     pub fn with_fault_tolerance(mut self, mode: FaultToleranceMode) -> Self {
         self.fault_tolerance = mode;
         self
     }
 
     /// Add an event to the chain (fluent API - consumes self)
+    ///
+    /// Events execute in the order they are added (FIFO).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let chain = EventChain::new()
+    ///     .event(ValidateEvent)   // Executes 1st
+    ///     .event(ProcessEvent)    // Executes 2nd
+    ///     .event(NotifyEvent);    // Executes 3rd
+    /// ```
+    ///
+    /// # Type Parameters
+    ///
+    /// * `E` - Any type implementing [`ChainableEvent`] + `'static`
     pub fn event<E: ChainableEvent + 'static>(mut self, event: E) -> Self {
         self.events.push(Box::new(event));
         self
     }
 
     /// Add a middleware to the chain (fluent API - consumes self)
+    ///
+    /// # ⚠️ Execution Order: LIFO (Last In, First Out)
+    ///
+    /// Middlewares execute in **reverse order** of registration - the last middleware
+    /// added will be the **first** to execute (outermost layer).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let chain = EventChain::new()
+    ///     .middleware(AuthMiddleware)      // Executes 3rd (innermost)
+    ///     .middleware(LoggingMiddleware)   // Executes 2nd
+    ///     .middleware(TimingMiddleware)    // Executes 1st (outermost)
+    ///     .event(MyEvent);
+    /// ```
+    ///
+    /// **Execution flow:**
+    /// ```text
+    /// TimingMiddleware (before)
+    ///   → LoggingMiddleware (before)
+    ///     → AuthMiddleware (before)
+    ///       → MyEvent.execute()
+    ///     ← AuthMiddleware (after)
+    ///   ← LoggingMiddleware (after)
+    /// ← TimingMiddleware (after)
+    /// ```
+    ///
+    /// This "onion" pattern means infrastructure middleware (timing, logging, metrics)
+    /// should typically be added **last** so they wrap around business logic middleware.
     pub fn middleware<M: EventMiddleware + 'static>(mut self, middleware: M) -> Self {
         self.middlewares.push(Box::new(middleware));
         self
     }
 
     /// Legacy method for adding boxed events (mutable reference API)
+    ///
+    /// Events execute in the order they are added (FIFO).
+    /// See [`event()`](Self::event) for the recommended fluent API.
     pub fn add_event(&mut self, event: Box<dyn ChainableEvent>) -> &mut Self {
         self.events.push(event);
         self
     }
 
     /// Legacy method for adding boxed middleware (mutable reference API)
+    ///
+    /// # ⚠️ Execution Order: LIFO (Last In, First Out)
+    ///
+    /// Middlewares execute in **reverse order** of registration.
+    /// See [`middleware()`](Self::middleware) for detailed explanation.
     pub fn use_middleware(&mut self, middleware: Box<dyn EventMiddleware>) -> &mut Self {
         self.middlewares.push(middleware);
         self
     }
 
+    /// Execute the event chain with the provided context
+    ///
+    /// Events execute in registration order (FIFO), with each event wrapped
+    /// by the middleware stack in reverse order (LIFO).
+    ///
+    /// # Returns
+    ///
+    /// [`ChainResult`] containing success status and any failures that occurred
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut context = EventContext::new();
+    /// let result = chain.execute(&mut context);
+    ///
+    /// match result.status {
+    ///     ChainStatus::Completed => println!("Success!"),
+    ///     ChainStatus::CompletedWithWarnings => println!("Partial success"),
+    ///     ChainStatus::Failed => println!("Failed"),
+    /// }
+    /// ```
     pub fn execute(&self, context: &mut EventContext) -> ChainResult {
         let mut failures = Vec::new();
 
